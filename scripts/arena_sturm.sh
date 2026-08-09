@@ -16,7 +16,7 @@ if [ -z "$TOPIC" ]; then
     exit 1
 fi
 
-BASE="arena-shurm"
+BASE="${ARENA_SESS:-arena-shurm}"
 SESS="$BASE"
 i=2
 while tmux has-session -t "$SESS" 2>/dev/null; do

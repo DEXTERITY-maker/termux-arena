@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 — Termux Arena. См. LICENSE.
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -20,13 +17,21 @@ Consensus:      python3 ~/.hermes/arena_chat.py --headless "тема" --consensu
 
 Режим «до согласия» (/consensus или --consensus): диалог идёт не фиксированное
 число ходов, а пока модель не зафиксирует согласованный вывод (маркеры: «итог»,
-«договорились», «согласовано», «фиксирую», «резюмирую», «план такой»). Потолок —
-30 ходов. /turns N — быстрый режим.
+«договорились», «согласовано», «фиксирую», «резюмирую», «план такой»).
+Детекция работает не раньше 4-го хода (обе модели высказываются дважды),
+потолок — 30 ходов. /turns N — быстрый режим.
 
 После завершения диалога в режимах /task и /consensus краткий итог доставляется
 в основную сессию Hermes (#1, tmux hermes-chat) как
 «[Arena → Hermes] Итог дискуссии: …» — Hermes в основном диалоге видит результат
 и может его исполнить. Если сессии нет — доставка тихо пропускается.
+
+Настройка через переменные окружения (токены/пути в коде не зашиваются,
+везде безопасные дефолты):
+  ARENA_HOME              — рабочая директория (по умолчанию ~)
+  ARENA_MAIN_SESSION      — tmux-сессия для доставки итога (hermes-chat)
+  ARENA_OMP_MODEL         — модель OMP (deepseek/deepseek-v4-flash)
+  ARENA_OMP_SYSTEM_PROMPT — системный промпт OMP
 """
 
 import argparse
@@ -39,17 +44,49 @@ import sys
 import threading
 import time
 
-HOME = os.path.expanduser("~")
+def env_str(name, default, maxlen=512):
+    """Переменная окружения с санитизацией: strip, лимит длины; пустое или
+    слишком длинное значение → безопасный дефолт. Токены/пути не зашиваются —
+    всё настраиваемое читается из env."""
+    v = os.environ.get(name, "")
+    v = v.strip()
+    if not v or len(v) > maxlen:
+        return default
+    return v
+
+
+def env_session_name(name, default):
+    """Имя tmux-сессии из env: только безопасные символы (без ведущего
+    дефиса, чтобы не быть принятым за флаг), иначе дефолт."""
+    v = env_str(name, default, maxlen=64)
+    return v if re.fullmatch(r"[A-Za-z0-9._-]+", v) and not v.startswith("-") \
+        else default
+
+
+def env_dir(name, default):
+    """Путь из env: должен существовать и быть директорией, иначе дефолт."""
+    v = env_str(name, default)
+    return v if os.path.isdir(v) else default
+
+
+HOME = env_dir("ARENA_HOME", os.path.expanduser("~"))
 DEFAULT_MAX_TURNS = 10
-TIMEOUT = 120          # защита от зависания, сек
+TIMEOUT = 300          # защита от зависания, сек
 PAUSE = 2.5            # пауза между ходами, сек
 CTX_WINDOW = 6         # последние N сообщений уходят в контекст
 MAX_MSG_CHARS = 1200   # обрезка длинных ответов в контексте
 EXEC_TIMEOUT = 300     # таймаут выполнения задачи, сек
 EXEC_CTX = 8           # последние N сообщений уходят в контекст задачи
 CONSENSUS_MAX = 30     # потолок ходов в режиме «до согласия»
+CONSENSUS_MIN = 4      # детекция согласия не раньше 4-го хода (обе модели высказались дважды)
 
-MAIN_SESSION = "hermes-chat"   # основная сессия Hermes (#1): сюда уходит итог
+MAIN_SESSION = env_session_name("ARENA_MAIN_SESSION", "hermes-chat")
+OMP_MODEL = env_str("ARENA_OMP_MODEL", "deepseek/deepseek-v4-flash", maxlen=128)
+OMP_SYSTEM_PROMPT = env_str(
+    "ARENA_OMP_SYSTEM_PROMPT",
+    "Ты — ИИ-агент OMP, участник автономной дискуссии с агентом Hermes. "
+    "Отвечай кратко, по делу, без пояснений формата.",
+    maxlen=2000)
 SUMMARY_MAX = 300              # максимальная длина сводки, символов
 
 FINAL_MARKERS = ("итог", "договорились", "согласовано",
@@ -71,10 +108,8 @@ def call_model(kind, text, timeout, stop_event=None):
                "--reasoning", "none"]
     else:
         cmd = ["omp", "-p", "--allow-home",
-               "--model", "deepseek/deepseek-v4-flash",
-               "--system-prompt",
-               "Ты — ИИ-агент OMP, участник автономной дискуссии с агентом "
-               "Hermes. Отвечай кратко, по делу, без пояснений формата."]
+               "--model", OMP_MODEL,
+               "--system-prompt", OMP_SYSTEM_PROMPT]
     try:
         use_stdin = (kind == "omp")
         p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -130,14 +165,15 @@ def tmux_session_alive(name=MAIN_SESSION):
 
 def send_to_main_session(text):
     """Отправляет text в основную сессию Hermes (#1) через tmux send-keys.
-    Обёртка в одинарные кавычки, апострофы экранируются ('\''). Если сессии
-    нет — тихо пропускает и возвращает False."""
+    shell=False: аргументы передаются списком, без shell-интерпретации —
+    пробелы и спецсимволы в сессии/тексте безопасны. Если сессии нет —
+    тихо пропускает и возвращает False."""
     if not tmux_session_alive():
         return False
-    safe = text.replace("'", "'\\''")
-    cmd = f"tmux send-keys -t {MAIN_SESSION} '{safe}' Enter"
     try:
-        subprocess.run(cmd, shell=True, timeout=10,
+        subprocess.run(["tmux", "send-keys", "-t", MAIN_SESSION,
+                        "--", text, "Enter"],
+                       timeout=10,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return True
     except Exception:
@@ -154,10 +190,12 @@ def build_prompt(topic, history, model, consensus=False):
     if model == "hermes" and not history:
         lines.append("Ты открываешь дискуссию. Начни: коротко обозначь свою позицию по теме.")
     elif consensus:
-        lines.append("Режим «до согласия»: дискуссия идёт, пока вы не придёте к "
-                     "согласованному выводу. Когда согласие достигнуто, начни "
-                     "финальный ответ со слова «Итог:» или «Согласовано:». До этого "
-                     "продолжай аргументированную дискуссию, реагируя на собеседника.")
+        lines.append(f"Режим «до согласия»: дискуссия идёт, пока вы не придёте к "
+                     f"согласованному выводу. Минимум {CONSENSUS_MIN} хода (обе "
+                     f"стороны высказываются дважды) — не фиксируй итог раньше. "
+                     f"Когда согласие достигнуто, начни финальный ответ со слова "
+                     f"«Итог:» или «Согласовано:». До этого продолжай "
+                     f"аргументированную дискуссию, реагируя на собеседника.")
     else:
         lines.append("Твой ход. Продолжи дискуссию: развивай тему, реагируй на аргументы собеседника.")
     lines.append("Отвечай по-русски, 3–6 предложений, без приветствий и служебных пояснений.")
@@ -218,7 +256,7 @@ class Dialogue:
                 return
             self.history.append((model, text))
             self.on_event("msg", model, text, turn=i + 1)
-            if self.consensus:
+            if self.consensus and i >= CONSENSUS_MIN - 1:
                 m = match_final_marker(text)
                 if m:
                     final_marker = m

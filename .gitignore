@@ -1,0 +1,22 @@
+# Секреты и конфиги
+.env
+*.env
+*.session
+tg_session*
+config.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Логи и временное
+*.log
+logs/
+backups/
+*.state
+*.tmp
+post*.html
+arena_dialog_raw.txt
+
+# Окружение
+.hermes_history

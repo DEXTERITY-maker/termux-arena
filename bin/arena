@@ -1,0 +1,4 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# arena — запуск арены двух моделей (Hermes ↔ OMP)
+# Примеры: arena | arena --headless "тема" --turns 5 | arena --smoke
+exec python3 ~/.hermes/arena_chat.py "$@"

@@ -1,0 +1,57 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# agents — единый CLI: выбор агента (Hermes / OMP / Арена)
+# Использование: agents [hermes|omp|arena|status|quit]
+
+find_ses() { # $1=процесс-паттерн $2=дефолтная сессия
+  local p tty found
+  for p in $(pgrep -f "$1" 2>/dev/null); do
+    tty=$(readlink "/proc/$p/fd/0" 2>/dev/null)
+    case "$tty" in /dev/pts/*) ;; *) continue ;; esac
+    if tmux has-session 2>/dev/null; then
+      found=$(tmux list-panes -a -F '#{session_name} #{pane_tty}' 2>/dev/null | awk -v t="$tty" '{ if ($2 == t) { print $1; exit } }')
+      [ -n "$found" ] && echo "$found" && return
+    fi
+  done
+  echo "$2"
+}
+
+start_or_attach() { # $1=паттерн процесса $2=команда старта $3=дефолтная сессия
+  local ses
+  ses=$(find_ses "$1" "$3")
+  if tmux has-session -t "$ses" 2>/dev/null; then
+    tmux attach -t "$ses"
+  else
+    tmux new-session -s "$ses" "$2"
+  fi
+}
+
+if [ -n "$1" ]; then
+  case "$1" in
+    hermes|h) start_or_attach "usr/bin/hermes" "hermes" "hermes-chat" ;;
+    omp|o)    start_or_attach "oh-my-pi/omp" "omp" "omp-chat" ;;
+    arena|a)  start_or_attach "agent_chat.py" "python3 ~/.hermes/agent_chat.py" "arena" ;;
+    status|s) tmux ls 2>&1 ;;
+    *) echo "agents [hermes|omp|arena|status]"; tmux ls 2>&1 ;;
+  esac
+  exit 0
+fi
+
+while true; do
+  echo ""
+  echo "╭── AGENTS CLI ──────────────────────────────╮"
+  echo "│  1) ⚕ Hermes    — агент публикаций         │"
+  echo "│  2) π OMP       — агент (DeepSeek V4 Pro)  │"
+  echo "│  3) ⚡ Арена     — Hermes | OMP (вместе)    │"
+  echo "│  4) 📋 Статус сессий                       │"
+  echo "│  0) Выход                                  │"
+  echo "╰─────────────────────────────────────────────╯"
+  read -p "Выбор: " c
+  case "$c" in
+    1|hermes) start_or_attach "usr/bin/hermes" "hermes" "hermes-chat" ;;
+    2|omp)    start_or_attach "oh-my-pi/omp" "omp" "omp-chat" ;;
+    3|arena)  start_or_attach "agent_chat.py" "python3 ~/.hermes/agent_chat.py" "arena" ;;
+    4|status) tmux ls 2>&1; sleep 1 ;;
+    0|q) echo "Пока"; exit 0 ;;
+    *) echo "Неверный выбор" ;;
+  esac
+done

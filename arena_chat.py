@@ -24,6 +24,15 @@ session_id без потерь и дублей; машиночитаемые м�
 POST-ом на ARENA_WEBHOOK_URL (ретраи 1,2,4 с). Фолбэк-провайдер OMP:
 ARENA_OMP_FALLBACK_MODEL — попытка после RETRIES=3 с задержкой 2,4,8 с.
 
+Интернет (v0.0.8): доступен всегда, пассивно — модели сами решают, когда
+обращаться к сети. Hermes вызывается с тулсетами browser,web (без
+--reasoning none); OMP — с включёнными инструментами (по умолчанию).
+Вебхуки (v0.0.8): отправка в daemon-потоке — ход диалога не блокируется.
+Маркер согласия распознаётся только в начале ответа («Итог:», «Согласовано:»).
+Сессия Hermes (v0.0.8): единая постоянная — создаётся при первом вызове,
+session_id хранится в <ARENA_HOME>/arena_hermes_session, дальше все вызовы
+идут через `hermes chat --resume <id>` (сессии не плодятся).
+
 Режим «дискуссия → задачка»: задай задачу (/task или --task) — после завершения
 диалога Hermes выполнит её с контекстом последних сообщений, результат — блок [EXEC].
 
@@ -63,7 +72,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-__version__ = "0.0.7"
+__version__ = "0.0.8"
 
 PROTOCOL_NAME = "arena-protocol"
 PROTOCOL_VERSION = 1
@@ -114,7 +123,7 @@ if LOG_LEVEL not in ("info", "debug"):
 RETRIES = 3            # попытки вызова модели (с экспоненциальной задержкой)
 RETRY_BACKOFF = (2, 4, 8)   # задержки между попытками, сек
 WEBHOOK_RETRIES = 3
-WEBHOOK_TIMEOUT = 10
+WEBHOOK_TIMEOUT = 5    # сек; отправка в потоке — ход диалога не блокируется
 OMP_SYSTEM_PROMPT = env_str(
     "ARENA_OMP_SYSTEM_PROMPT",
     "Ты — ИИ-агент OMP, участник автономной дискуссии с агентом Hermes. "
@@ -128,9 +137,62 @@ FINAL_MARKERS = ("итог", "договорились", "согласовано
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 BOX_RE = re.compile(r"┌─.*?┐.*?└─.*?┘", re.S)  # блок рассуждений hermes
 
+SID_RE = re.compile(r"[0-9a-fA-F]{8}")   # session_id: ровно 8 hex-символов
+HERMES_SID_RE = re.compile(r"[0-9]{8}_[0-9]{6}_[0-9a-fA-F]{6}")
+HERMES_SESSION_FILE = os.path.join(HOME, "arena_hermes_session")
+
 
 def now_ts():
     return dt.datetime.now().strftime("%H:%M:%S")
+
+
+def hermes_session_read():
+    """session_id постоянной сессии Hermes из файла арены (или None)."""
+    try:
+        with open(HERMES_SESSION_FILE, encoding="utf-8") as f:
+            sid = f.read().strip()
+        return sid if HERMES_SID_RE.fullmatch(sid) else None
+    except OSError:
+        return None
+
+
+def hermes_session_write(sid):
+    """Сохранить session_id постоянной сессии Hermes (атомарно tmp+rename)."""
+    if not sid or not HERMES_SID_RE.fullmatch(sid):
+        return
+    tmp = HERMES_SESSION_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(sid + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, HERMES_SESSION_FILE)
+    except OSError:
+        pass
+
+
+def hermes_session_clear():
+    """Сброс session_id (сессия пропала — следующий вызов создаст новую)."""
+    try:
+        os.remove(HERMES_SESSION_FILE)
+    except OSError:
+        pass
+
+
+def parse_hermes_session(out):
+    """session_id из вывода `hermes chat -Q` (после первого запуска)."""
+    m = re.search(r"session[:_\s]*([0-9]{8}_[0-9]{6}_[0-9a-fA-F]{6})",
+                  out or "")
+    if m:
+        return m.group(1)
+    m = re.search(r"([0-9]{8}_[0-9]{6}_[0-9a-fA-F]{6})", out or "")
+    return m.group(1) if m else None
+
+
+def _is_missing_session(err):
+    low = (err or "").lower()
+    return ("не найдена" in low or "not found" in low
+            or "no such session" in low)
 
 
 def call_model(kind, text, timeout, stop_event=None, session_id=None):
@@ -142,6 +204,7 @@ def call_model(kind, text, timeout, stop_event=None, session_id=None):
     if kind == "omp" and OMP_FALLBACK_MODEL:
         attempts.append("fallback")
     last_err = ""
+    resume_sid = hermes_session_read() if kind == "hermes" else None
     for attempt in attempts:
         if stop_event is not None and stop_event.is_set():
             return False, "", "остановлено по /stop"
@@ -150,14 +213,16 @@ def call_model(kind, text, timeout, stop_event=None, session_id=None):
                    "--model", OMP_FALLBACK_MODEL,
                    "--system-prompt", OMP_SYSTEM_PROMPT]
         elif kind == "hermes":
-            cmd = ["hermes", "chat", "-q", text, "-Q", "-t", "",
-                   "--reasoning", "none"]
+            cmd = ["hermes", "chat", "-q", text, "-Q",
+                   "-t", "browser,web"]
+            if resume_sid:
+                cmd += ["--resume", resume_sid]
         else:
             cmd = ["omp", "-p", "--allow-home",
                    "--model", OMP_MODEL,
                    "--system-prompt", OMP_SYSTEM_PROMPT]
         label = "omp-fallback" if attempt == "fallback" else kind
-        log_write(session_id or "-", "debug",
+        log_write(session_id, "debug",
                   f"вызов {label} (попытка {attempts.index(attempt) + 1}/"
                   f"{len(attempts)})…")
         try:
@@ -182,8 +247,17 @@ def call_model(kind, text, timeout, stop_event=None, session_id=None):
             if rc is not None:
                 out, err = p.communicate()
                 if rc == 0:
+                    if kind == "hermes":
+                        nsid = (parse_hermes_session(out)
+                                or parse_hermes_session(err))
+                        if nsid:
+                            hermes_session_write(nsid)
                     return True, out, err
                 last_err = err.strip() or f"exit {rc}"
+                if kind == "hermes" and resume_sid \
+                   and _is_missing_session(err):
+                    hermes_session_clear()
+                    resume_sid = None   # следующая попытка — новая сессия
                 break
             if time.time() - start > timeout:
                 p.kill()
@@ -194,9 +268,13 @@ def call_model(kind, text, timeout, stop_event=None, session_id=None):
         if attempt != attempts[-1]:
             delay = RETRY_BACKOFF[min(attempts.index(attempt),
                                       len(RETRY_BACKOFF) - 1)]
-            log_write(session_id or "-", "debug",
+            log_write(session_id, "debug",
                       f"{label}: сбой ({last_err}), повтор через {delay}с")
-            time.sleep(delay)
+            deadline = time.time() + delay
+            while time.time() < deadline:
+                if stop_event is not None and stop_event.is_set():
+                    return False, "", "остановлено по /stop"
+                time.sleep(0.2)
     return False, "", last_err
 
 
@@ -207,11 +285,14 @@ def clean(text):
 
 
 def match_final_marker(text):
-    """Возвращает маркер завершения из ответа или None (режим «до согласия»)."""
-    low = text.lower()
+    """Маркер завершения, только если ответ НАЧИНАЕТСЯ с него.
+    Подстроки («в итоге я считаю…», «не согласовано») согласием не считаются."""
+    low = re.sub(r"^\W+", "", text.lower())
     for m in FINAL_MARKERS:
-        if m in low:
-            return m
+        if low.startswith(m):
+            rest = low[len(m):]
+            if not rest or rest[0] in ":!.,»)\"'…— ":
+                return m
     return None
 
 
@@ -327,6 +408,8 @@ def save_session(sess):
     tmp = p + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(sess, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, p)
 
 
@@ -350,7 +433,7 @@ def history_from_sess(sess):
 def log_write(session_id, level, text):
     """Полное логирование диалога в файл arena_logs/<session_id>.log.
     debug-строки пишутся только при LOG_LEVEL=debug."""
-    if level == "debug" and LOG_LEVEL != "debug":
+    if not session_id or (level == "debug" and LOG_LEVEL != "debug"):
         return
     try:
         with open(os.path.join(logs_dir(), f"{session_id}.log"),
@@ -360,12 +443,15 @@ def log_write(session_id, level, text):
         pass
 
 
-def send_webhook(sess, event, model=None, turn=None, text=None, extra=None):
+_WEBHOOK_THREADS = []
+
+
+def _webhook_post(sess, event, model=None, turn=None, text=None, extra=None):
     """POST машиночитаемого события на ARENA_WEBHOOK_URL.
-    Ретраи с экспоненциальной задержкой (1,2,4 с), тихий фейл (не ломает
-    диалог). Возвращает True/False."""
+    Ретраи 1,2,4 с, тихий фейл. Вызывается в daemon-потоке — диалог
+    не блокируется и не ломается."""
     if not WEBHOOK_URL:
-        return False
+        return
     payload = {
         "protocol": PROTOCOL_NAME,
         "protocol_version": PROTOCOL_VERSION,
@@ -387,14 +473,25 @@ def send_webhook(sess, event, model=None, turn=None, text=None, extra=None):
             req.add_header("Content-Type", "application/json")
             with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT) as r:
                 r.read()
-            return True
+            return
         except Exception as e:
             last_err = str(e)
             if attempt < WEBHOOK_RETRIES - 1:
                 time.sleep(2 ** attempt)   # 1, 2, 4 с
     log_write(sess["session_id"], "warn",
               f"вебхук {event} не доставлен ({WEBHOOK_RETRIES} попыток): {last_err}")
-    return False
+
+
+def send_webhook(sess, event, model=None, turn=None, text=None, extra=None):
+    """Отправка события в daemon-потоке: ход диалога не блокируется даже при
+    недоступном вебхуке. Headless дожидается потоков после диалога."""
+    if not WEBHOOK_URL:
+        return
+    t = threading.Thread(target=_webhook_post,
+                         args=(sess, event, model, turn, text, extra),
+                         daemon=True)
+    _WEBHOOK_THREADS.append(t)
+    t.start()
 
 
 class Dialogue:
@@ -404,7 +501,7 @@ class Dialogue:
 
     def __init__(self, topic, max_turns, on_event, stop_event, task=None,
                  consensus=False, session_id=None, quiet=False,
-                 crash_after=None):
+                 crash_after=None, call_fn=None):
         self.topic = topic
         self.max_turns = max_turns
         self.on_event = on_event        # on_event(kind, title, text)
@@ -413,6 +510,7 @@ class Dialogue:
         self.consensus = consensus      # режим «до согласия» (маркеры, потолок 30)
         self.quiet = quiet              # компактный вывод в stdout
         self.crash_after = crash_after  # тест обрыва: «умереть» после N ходов
+        self.call_fn = call_fn or call_model  # хук вызова модели (selftest мокает)
         self.sess = None                # метаданные протокола v1
         self.history = []
         self.exec_done = False          # задача реально выполнена ([EXEC] отдан)
@@ -423,6 +521,8 @@ class Dialogue:
     # ── протокол v1 ──
 
     def _load(self, session_id):
+        if not SID_RE.fullmatch(session_id or ""):
+            raise ValueError(f"некорректный session_id: {session_id!r}")
         sess = load_session(session_id)
         if sess is None:
             raise ValueError(f"сессия {session_id} не найдена в {sessions_dir()}")
@@ -494,7 +594,7 @@ class Dialogue:
                 turn_no = i + 1
                 self.on_event("status", None,
                               f"ход {turn_no}/{turns} · {model} думает…")
-                ok, out, err = call_model(
+                ok, out, err = self.call_fn(
                     model, build_prompt(self.topic, self.history, model,
                                         self.consensus),
                     TIMEOUT, self.stop, self.sess["session_id"])
@@ -552,17 +652,20 @@ class Dialogue:
             log_write(self.sess["session_id"], "info",
                       f"завершено: {len(self.history)} ходов, "
                       f"status=completed")
-            send_webhook(self.sess, "session_end",
-                         extra={"turns": len(self.history)})
             if self.task:
                 self.run_task()
+            send_webhook(self.sess, "session_end",
+                         extra={"turns": len(self.history)})
             # доставка итога в основную сессию Hermes (#1) — только после реального диалога
             if (self.task or self.consensus) and self.history:
                 self.deliver_summary()
         except Exception as e:
             # любой сбой — сессия помечается interrupted, данные не теряются
             if self.sess is not None:
-                self._interrupt(f"исключение: {e}")
+                try:
+                    self._interrupt(f"исключение: {e}")
+                except Exception:
+                    pass   # не маскировать исходное исключение
             raise
 
     def run_task(self):
@@ -573,8 +676,8 @@ class Dialogue:
                   f"Контекст дискуссии (итог обсуждения):\n{hist}\n"
                   "Дай практический результат по задаче, опираясь на контекст. "
                   "Отвечай по-русски, конкретно и по делу.")
-        ok, out, err = call_model("hermes", prompt, EXEC_TIMEOUT, self.stop,
-                                  self.sess["session_id"] if self.sess else None)
+        ok, out, err = self.call_fn("hermes", prompt, EXEC_TIMEOUT, self.stop,
+                                    self.sess["session_id"] if self.sess else None)
         if not ok:
             self.on_event("warn", "⚠", f"[EXEC] не выполнен: {err}")
             return
@@ -629,6 +732,11 @@ def run_headless(topic, turns, task=None, consensus=False, session_id=None,
         print(f"⚠ {e}")
         return 2
     d.run()
+    # дождаться daemon-потоков вебхуков (иначе процесс выйдет раньше них)
+    for t in list(_WEBHOOK_THREADS):
+        t.join(timeout=25)
+        if t in _WEBHOOK_THREADS:
+            _WEBHOOK_THREADS.remove(t)
     n = 0
     e = 0
     c_turn = None
@@ -665,15 +773,25 @@ def selftest_drop():
     """АВТОТЕСТ ОБРЫВА СЕССИИ (критерий приёмки v0.0.7):
     1) диалог на 2 хода с имитацией обрыва (статус остаётся running);
     2) resume по session_id — продолжение без потерь и дублей контекста;
-    3) проверка: 4 хода, номера уникальны, тексты ходов 1–2 сохранены."""
+    3) проверка: 4 хода, номера уникальны, тексты ходов 1–2 сохранены.
+    Вызовы моделей замоканы (проверяется протокол, а не модели)."""
     print(f"arena_chat {__version__} · selftest-drop (обрыв сессии)")
     sid = None
     try:
+        def fake_call_model(kind, text, timeout, stop_event=None,
+                            session_id=None):
+            """Мок вызова модели: детерминированные ответы без реальных CLI
+            (selftest проверяет протокол сохранения/резюма, а не модели)."""
+            n = fake_call_model.n
+            fake_call_model.n += 1
+            return True, f"ход {n}: ответ модели {kind} (тест)", ""
+        fake_call_model.n = 0
         stop = threading.Event()
         ev = queue.Queue()
         d1 = Dialogue("Самопроверка обрыва сессии", 4,
                       lambda k, t, x, turn=None: ev.put((k, t, x, turn)),
-                      stop, None, False, crash_after=2)
+                      stop, None, False, crash_after=2,
+                      call_fn=fake_call_model)
         d1.run()
         sid = d1.sess["session_id"] if d1.sess else None
         if not sid:
@@ -695,7 +813,8 @@ def selftest_drop():
         ev2 = queue.Queue()
         d2 = Dialogue("", 4,
                       lambda k, t, x, turn=None: ev2.put((k, t, x, turn)),
-                      stop2, None, False, session_id=sid)
+                      stop2, None, False, session_id=sid,
+                      call_fn=fake_call_model)
         d2.run()
         sess2 = load_session(sid)
         if sess2.get("status") != "completed":
@@ -724,9 +843,18 @@ def selftest_drop():
 
 def session_info(session_id):
     """Машиночитаемые метаданные сессии (протокол v1) в stdout."""
-    sess = load_session(session_id)
-    if sess is None:
+    if not SID_RE.fullmatch(session_id or ""):
+        print(f"некорректный session_id: {session_id!r}")
+        return 1
+    p = session_path(session_id)
+    if not os.path.exists(p):
         print(f"сессия {session_id} не найдена в {sessions_dir()}")
+        return 1
+    try:
+        with open(p, encoding="utf-8") as f:
+            sess = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"сессия {session_id}: повреждён файл ({e})")
         return 1
     print(json.dumps(sess, ensure_ascii=False, indent=2))
     return 0

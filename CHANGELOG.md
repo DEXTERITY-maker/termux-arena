@@ -5,6 +5,11 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 проект придерживается [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [0.0.10] — 2026-08-10
+
+### Changed
+- Промпты арены требуют русский язык для всего ответа, включая внутренние рассуждения
+
 ## [0.0.9] — 2026-08-10
 
 ### Added

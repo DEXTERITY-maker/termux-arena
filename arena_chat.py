@@ -9,8 +9,20 @@ ARENA: единый интерактивный чат двух моделей �
 Запуск без UI:  python3 ~/.hermes/arena_chat.py --headless "тема" --turns 4 --task "задача"
 Смоук-тест UI:  python3 ~/.hermes/arena_chat.py --smoke
 Consensus:      python3 ~/.hermes/arena_chat.py --headless "тема" --consensus --task "задача"
+Resume:         python3 ~/.hermes/arena_chat.py --headless "тема" --resume <session_id>
+Тихий режим:    python3 ~/.hermes/arena_chat.py --headless "тема" --quiet --log-level debug
+Метаданные:     python3 ~/.hermes/arena_chat.py --session-info <session_id>
+Автотест:       python3 ~/.hermes/arena_chat.py --selftest-drop
 
 Команды: /start <тема> · /stop · /turns N · /task <задача> · /consensus · /clear · /status · /quit
+
+Протокол v1 (v0.0.7): каждая сессия сохраняется в ~/arena_sessions/<id>.json
+(topic/participants/status/history) после каждого хода — восстановление по
+session_id без потерь и дублей; машиночитаемые метаданные — --session-info.
+Полный лог диалога: ~/arena_logs/<session_id>.log (ARENA_LOG_LEVEL=info|debug).
+Вебхуки: события session_start/turn/exec/session_end/interrupt/resume
+POST-ом на ARENA_WEBHOOK_URL (ретраи 1,2,4 с). Фолбэк-провайдер OMP:
+ARENA_OMP_FALLBACK_MODEL — попытка после RETRIES=3 с задержкой 2,4,8 с.
 
 Режим «дискуссия → задачка»: задай задачу (/task или --task) — после завершения
 диалога Hermes выполнит её с контекстом последних сообщений, результат — блок [EXEC].
@@ -31,11 +43,15 @@ Consensus:      python3 ~/.hermes/arena_chat.py --headless "тема" --consensu
   ARENA_HOME              — рабочая директория (по умолчанию ~)
   ARENA_MAIN_SESSION      — tmux-сессия для доставки итога (hermes-chat)
   ARENA_OMP_MODEL         — модель OMP (deepseek/deepseek-v4-flash)
+  ARENA_OMP_FALLBACK_MODEL— фолбэк-модель OMP (пусто = нет фолбэка)
   ARENA_OMP_SYSTEM_PROMPT — системный промпт OMP
+  ARENA_WEBHOOK_URL       — вебхук событий (пусто = выключен)
+  ARENA_LOG_LEVEL         — уровень лог-файла: info | debug (info)
 """
 
 import argparse
 import datetime as dt
+import json
 import os
 import queue
 import re
@@ -43,8 +59,14 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+import uuid
 
-__version__ = "0.0.5"
+__version__ = "0.0.7"
+
+PROTOCOL_NAME = "arena-protocol"
+PROTOCOL_VERSION = 1
 
 def env_str(name, default, maxlen=512):
     """Переменная окружения с санитизацией: strip, лимит длины; пустое или
@@ -84,6 +106,15 @@ CONSENSUS_MIN = 4      # детекция согласия не раньше 4-�
 
 MAIN_SESSION = env_session_name("ARENA_MAIN_SESSION", "hermes-chat")
 OMP_MODEL = env_str("ARENA_OMP_MODEL", "deepseek/deepseek-v4-flash", maxlen=128)
+OMP_FALLBACK_MODEL = env_str("ARENA_OMP_FALLBACK_MODEL", "", maxlen=128)
+WEBHOOK_URL = env_str("ARENA_WEBHOOK_URL", "", maxlen=2048)
+LOG_LEVEL = env_str("ARENA_LOG_LEVEL", "info", maxlen=16).lower()
+if LOG_LEVEL not in ("info", "debug"):
+    LOG_LEVEL = "info"
+RETRIES = 3            # попытки вызова модели (с экспоненциальной задержкой)
+RETRY_BACKOFF = (2, 4, 8)   # задержки между попытками, сек
+WEBHOOK_RETRIES = 3
+WEBHOOK_TIMEOUT = 10
 OMP_SYSTEM_PROMPT = env_str(
     "ARENA_OMP_SYSTEM_PROMPT",
     "Ты — ИИ-агент OMP, участник автономной дискуссии с агентом Hermes. "
@@ -102,42 +133,71 @@ def now_ts():
     return dt.datetime.now().strftime("%H:%M:%S")
 
 
-def call_model(kind, text, timeout, stop_event=None):
+def call_model(kind, text, timeout, stop_event=None, session_id=None):
     """Программный вызов модели. Возвращает (ok, stdout, err).
+    Ретраи с экспоненциальной задержкой (2,4,8 с); для omp при окончательном
+    сбое — фолбэк-модель (ARENA_OMP_FALLBACK_MODEL), если задана.
     stop_event: при установке подпроцесс убивается (реагирует /stop мгновенно)."""
-    if kind == "hermes":
-        cmd = ["hermes", "chat", "-q", text, "-Q", "-t", "",
-               "--reasoning", "none"]
-    else:
-        cmd = ["omp", "-p", "--allow-home",
-               "--model", OMP_MODEL,
-               "--system-prompt", OMP_SYSTEM_PROMPT]
-    try:
-        use_stdin = (kind == "omp")
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                             stderr=subprocess.PIPE,
-                             stdin=subprocess.PIPE if use_stdin else None,
-                             text=True, cwd=HOME)
-        if use_stdin:
-            p.stdin.write(text + "\n")
-            p.stdin.close()
-    except Exception as e:
-        return False, "", str(e)
-    start = time.time()
-    while True:
+    attempts = list(range(RETRIES))
+    if kind == "omp" and OMP_FALLBACK_MODEL:
+        attempts.append("fallback")
+    last_err = ""
+    for attempt in attempts:
         if stop_event is not None and stop_event.is_set():
-            p.kill()
-            p.communicate()
             return False, "", "остановлено по /stop"
-        rc = p.poll()
-        if rc is not None:
-            out, err = p.communicate()
-            return rc == 0, out, err
-        if time.time() - start > timeout:
-            p.kill()
-            p.communicate()
-            return False, "", f"таймаут {timeout}с"
-        time.sleep(0.2)
+        if attempt == "fallback":
+            cmd = ["omp", "-p", "--allow-home",
+                   "--model", OMP_FALLBACK_MODEL,
+                   "--system-prompt", OMP_SYSTEM_PROMPT]
+        elif kind == "hermes":
+            cmd = ["hermes", "chat", "-q", text, "-Q", "-t", "",
+                   "--reasoning", "none"]
+        else:
+            cmd = ["omp", "-p", "--allow-home",
+                   "--model", OMP_MODEL,
+                   "--system-prompt", OMP_SYSTEM_PROMPT]
+        label = "omp-fallback" if attempt == "fallback" else kind
+        log_write(session_id or "-", "debug",
+                  f"вызов {label} (попытка {attempts.index(attempt) + 1}/"
+                  f"{len(attempts)})…")
+        try:
+            use_stdin = (kind == "omp")
+            p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE,
+                                 stdin=subprocess.PIPE if use_stdin else None,
+                                 text=True, cwd=HOME)
+            if use_stdin:
+                p.stdin.write(text + "\n")
+                p.stdin.close()
+        except Exception as e:
+            last_err = str(e)
+            continue
+        start = time.time()
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                p.kill()
+                p.communicate()
+                return False, "", "остановлено по /stop"
+            rc = p.poll()
+            if rc is not None:
+                out, err = p.communicate()
+                if rc == 0:
+                    return True, out, err
+                last_err = err.strip() or f"exit {rc}"
+                break
+            if time.time() - start > timeout:
+                p.kill()
+                p.communicate()
+                last_err = f"таймаут {timeout}с"
+                break
+            time.sleep(0.2)
+        if attempt != attempts[-1]:
+            delay = RETRY_BACKOFF[min(attempts.index(attempt),
+                                      len(RETRY_BACKOFF) - 1)]
+            log_write(session_id or "-", "debug",
+                      f"{label}: сбой ({last_err}), повтор через {delay}с")
+            time.sleep(delay)
+    return False, "", last_err
 
 
 def clean(text):
@@ -216,70 +276,294 @@ def normalize(t):
     return re.sub(r"\s+", " ", t).strip().lower()[:300]
 
 
+# ─────────────────── Протокол v1: сессии, лог, вебхуки ───────────────────
+
+def sessions_dir():
+    d = os.path.join(HOME, "arena_sessions")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def logs_dir():
+    d = os.path.join(HOME, "arena_logs")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def session_path(session_id):
+    return os.path.join(sessions_dir(), f"{session_id}.json")
+
+
+def new_session_id():
+    return uuid.uuid4().hex[:8]
+
+
+def make_session(topic, mode, max_turns, task=None):
+    """Новая сессия протокола v1. Возвращает dict-метаданные."""
+    ts = dt.datetime.now().isoformat(timespec="seconds")
+    return {
+        "protocol": PROTOCOL_NAME,
+        "protocol_version": PROTOCOL_VERSION,
+        "session_id": new_session_id(),
+        "topic": topic,
+        "participants": ["hermes", "omp"],
+        "status": "running",
+        "mode": mode,                 # "turns" | "consensus"
+        "max_turns": max_turns,
+        "task": task,
+        "final_marker": None,
+        "exec_done": False,
+        "turns": 0,
+        "created_at": ts,
+        "updated_at": ts,
+        "history": [],
+    }
+
+
+def save_session(sess):
+    """Атомарная запись сессии (tmp + rename). Никогда не теряет данные."""
+    sess["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+    p = session_path(sess["session_id"])
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(sess, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, p)
+
+
+def load_session(session_id):
+    """Загрузка сессии протокола v1 или None."""
+    p = session_path(session_id)
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def history_from_sess(sess):
+    """[(model, text), ...] из машиночитаемой истории сессии."""
+    return [(h["model"], h["text"]) for h in sess.get("history", [])]
+
+
+def log_write(session_id, level, text):
+    """Полное логирование диалога в файл arena_logs/<session_id>.log.
+    debug-строки пишутся только при LOG_LEVEL=debug."""
+    if level == "debug" and LOG_LEVEL != "debug":
+        return
+    try:
+        with open(os.path.join(logs_dir(), f"{session_id}.log"),
+                  "a", encoding="utf-8") as f:
+            f.write(f"[{now_ts()}] [{level.upper()}] {text}\n")
+    except OSError:
+        pass
+
+
+def send_webhook(sess, event, model=None, turn=None, text=None, extra=None):
+    """POST машиночитаемого события на ARENA_WEBHOOK_URL.
+    Ретраи с экспоненциальной задержкой (1,2,4 с), тихий фейл (не ломает
+    диалог). Возвращает True/False."""
+    if not WEBHOOK_URL:
+        return False
+    payload = {
+        "protocol": PROTOCOL_NAME,
+        "protocol_version": PROTOCOL_VERSION,
+        "session_id": sess["session_id"],
+        "event": event,
+        "status": sess.get("status"),
+        "turn": turn,
+        "model": model,
+        "text": (text[:2000] if text else None),
+        "ts": dt.datetime.now().isoformat(timespec="seconds"),
+    }
+    if extra:
+        payload.update(extra)
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    last_err = ""
+    for attempt in range(WEBHOOK_RETRIES):
+        try:
+            req = urllib.request.Request(WEBHOOK_URL, data=data, method="POST")
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=WEBHOOK_TIMEOUT) as r:
+                r.read()
+            return True
+        except Exception as e:
+            last_err = str(e)
+            if attempt < WEBHOOK_RETRIES - 1:
+                time.sleep(2 ** attempt)   # 1, 2, 4 с
+    log_write(sess["session_id"], "warn",
+              f"вебхук {event} не доставлен ({WEBHOOK_RETRIES} попыток): {last_err}")
+    return False
+
+
 class Dialogue:
-    """Движок автодиалога. Работает в отдельном потоке, события — через on_event."""
+    """Движок автодиалога. Работает в отдельном потоке, события — через on_event.
+    Протокол v1: сессия (topic/participants/status/history) сохраняется после
+    каждого хода; при session_id — восстанавливается без потерь и дублей."""
 
     def __init__(self, topic, max_turns, on_event, stop_event, task=None,
-                 consensus=False):
+                 consensus=False, session_id=None, quiet=False,
+                 crash_after=None):
         self.topic = topic
         self.max_turns = max_turns
         self.on_event = on_event        # on_event(kind, title, text)
         self.stop = stop_event
         self.task = task                # задача для режима «дискуссия → задачка»
         self.consensus = consensus      # режим «до согласия» (маркеры, потолок 30)
+        self.quiet = quiet              # компактный вывод в stdout
+        self.crash_after = crash_after  # тест обрыва: «умереть» после N ходов
+        self.sess = None                # метаданные протокола v1
         self.history = []
         self.exec_done = False          # задача реально выполнена ([EXEC] отдан)
+        self.base_turns = 0             # ходов уже было до этого запуска (resume)
+        if session_id:
+            self._load(session_id)
+
+    # ── протокол v1 ──
+
+    def _load(self, session_id):
+        sess = load_session(session_id)
+        if sess is None:
+            raise ValueError(f"сессия {session_id} не найдена в {sessions_dir()}")
+        if sess.get("status") == "completed":
+            raise ValueError(f"сессия {session_id} уже завершена — начните новую")
+        if sess.get("protocol_version") != PROTOCOL_VERSION:
+            raise ValueError(f"несовместимая версия протокола: "
+                             f"{sess.get('protocol_version')} != {PROTOCOL_VERSION}")
+        self.sess = sess
+        self.topic = sess.get("topic", self.topic)
+        self.task = sess.get("task")
+        self.consensus = sess.get("mode") == "consensus"
+        self.max_turns = sess.get("max_turns", self.max_turns)
+        self.history = history_from_sess(sess)
+        self.base_turns = len(self.history)
+        self.sess["status"] = "running"   # обрыв → продолжаем
+
+    def _save(self, final_marker=None):
+        if self.sess is None:
+            return
+        self.sess["history"] = [
+            {"turn": i + 1, "model": m, "ts": now_ts(), "text": t}
+            for i, (m, t) in enumerate(self.history)
+        ]
+        self.sess["turns"] = len(self.history)
+        if final_marker:
+            self.sess["final_marker"] = final_marker
+        self.sess["exec_done"] = self.exec_done
+        save_session(self.sess)
+
+    def _interrupt(self, reason):
+        if self.sess is None:
+            return
+        self.sess["status"] = "interrupted"
+        self._save()
+        log_write(self.sess["session_id"], "warn", f"прервано: {reason}")
+        send_webhook(self.sess, "session_interrupt", extra={"reason": reason})
+
+    # ── основной цикл ──
 
     def run(self):
-        turns = CONSENSUS_MAX if self.consensus else self.max_turns
-        final_marker = None
-        for i in range(turns):
-            if self.stop.is_set():
-                self.on_event("warn", "⏹", "Диалог остановлен по /stop")
-                return
-            model = "hermes" if i % 2 == 0 else "omp"
-            self.on_event("status", None,
-                          f"ход {i+1}/{turns} · {model} думает…")
-            ok, out, err = call_model(model, build_prompt(self.topic, self.history, model, self.consensus), TIMEOUT, self.stop)
-            if self.stop.is_set():
-                self.on_event("warn", "⏹", "Диалог остановлен по /stop")
-                return
-            if not ok:
-                self.on_event("warn", "⚠", f"[{model.upper()}] не ответил: {err}")
-                return
-            text = clean(out)
-            if not text:
-                self.on_event("warn", "⚠", f"[{model.upper()}] вернул пустой ответ")
-                return
-            # анти-зацикливание: тот же ответ, что в прошлый раз у этой модели
-            if len(self.history) >= 2 and self.history[-2][0] == model \
-               and normalize(text) == normalize(self.history[-2][1]):
-                self.on_event("warn", "⟳", f"[{model.upper()}] дословно повторил свой прошлый ответ — диалог остановлен")
-                return
-            self.history.append((model, text))
-            self.on_event("msg", model, text, turn=i + 1)
-            if self.consensus and i >= CONSENSUS_MIN - 1:
-                m = match_final_marker(text)
-                if m:
-                    final_marker = m
-                    self.on_event("consensus", model, m, turn=i + 1)
-                    break
-            if i < turns - 1:
-                time.sleep(PAUSE)
-        if self.consensus:
-            if final_marker:
+        try:
+            if self.sess is None:
+                mode = "consensus" if self.consensus else "turns"
+                self.sess = make_session(self.topic, mode, self.max_turns,
+                                         self.task)
+                self._save()
+                log_write(self.sess["session_id"], "info",
+                          f"сессия {self.sess['session_id']}: тема «{self.topic}»")
+                send_webhook(self.sess, "session_start")
                 self.on_event("status", None,
-                              f"диалог завершён: согласованный вывод (маркер «{final_marker}»)")
+                              f"сессия {self.sess['session_id']} · {mode}")
+            elif self.base_turns:
+                log_write(self.sess["session_id"], "info",
+                          f"возобновление: {self.base_turns} ходов восстановлено")
+                send_webhook(self.sess, "session_resume",
+                             extra={"resumed_turns": self.base_turns})
+                self.on_event("status", None,
+                              f"возобновлено: {self.base_turns} ходов из "
+                              f"сессии {self.sess['session_id']}")
+            turns = CONSENSUS_MAX if self.consensus else self.max_turns
+            final_marker = None
+            for i in range(self.base_turns, turns):
+                if self.stop.is_set():
+                    self.on_event("warn", "⏹", "Диалог остановлен по /stop")
+                    self._interrupt("остановлен по /stop")
+                    return
+                model = "hermes" if i % 2 == 0 else "omp"
+                turn_no = i + 1
+                self.on_event("status", None,
+                              f"ход {turn_no}/{turns} · {model} думает…")
+                ok, out, err = call_model(
+                    model, build_prompt(self.topic, self.history, model,
+                                        self.consensus),
+                    TIMEOUT, self.stop, self.sess["session_id"])
+                if self.stop.is_set():
+                    self.on_event("warn", "⏹", "Диалог остановлен по /stop")
+                    self._interrupt("остановлен по /stop")
+                    return
+                if not ok:
+                    self.on_event("warn", "⚠", f"[{model.upper()}] не ответил: {err}")
+                    self._interrupt(f"{model} не ответил: {err}")
+                    return
+                text = clean(out)
+                if not text:
+                    self.on_event("warn", "⚠", f"[{model.upper()}] вернул пустой ответ")
+                    self._interrupt(f"{model} пустой ответ")
+                    return
+                # анти-зацикливание: тот же ответ, что в прошлый раз у этой модели
+                if len(self.history) >= 2 and self.history[-2][0] == model \
+                   and normalize(text) == normalize(self.history[-2][1]):
+                    self.on_event("warn", "⟳", f"[{model.upper()}] дословно повторил свой прошлый ответ — диалог остановлен")
+                    self._interrupt("анти-зацикливание")
+                    return
+                self.history.append((model, text))
+                self._save()
+                log_write(self.sess["session_id"], "info",
+                          f"ход {turn_no} [{model.upper()}]: {text[:200]}")
+                self.on_event("msg", model, text, turn=turn_no)
+                send_webhook(self.sess, "turn", model=model, turn=turn_no,
+                             text=text)
+                if self.consensus and i >= CONSENSUS_MIN - 1:
+                    m = match_final_marker(text)
+                    if m:
+                        final_marker = m
+                        self._save(final_marker)
+                        self.on_event("consensus", model, m, turn=turn_no)
+                        break
+                if self.crash_after and turn_no >= self.crash_after:
+                    # имитация обрыва: статус остаётся running, история цела
+                    self.on_event("warn", "💥",
+                                  f"имитация обрыва после хода {turn_no}")
+                    return
+                if i < turns - 1:
+                    time.sleep(PAUSE)
+            if self.consensus:
+                if final_marker:
+                    self.on_event("status", None,
+                                  f"диалог завершён: согласованный вывод (маркер «{final_marker}»)")
+                else:
+                    self.on_event("status", None,
+                                  f"диалог завершён: потолок {CONSENSUS_MAX} ходов без маркера")
             else:
-                self.on_event("status", None,
-                              f"диалог завершён: потолок {CONSENSUS_MAX} ходов без маркера")
-        else:
-            self.on_event("status", None, "диалог завершён: лимит ходов")
-        if self.task:
-            self.run_task()
-        # доставка итога в основную сессию Hermes (#1) — только после реального диалога
-        if (self.task or self.consensus) and self.history:
-            self.deliver_summary()
+                self.on_event("status", None, "диалог завершён: лимит ходов")
+            self.sess["status"] = "completed"
+            self._save(final_marker)
+            log_write(self.sess["session_id"], "info",
+                      f"завершено: {len(self.history)} ходов, "
+                      f"status=completed")
+            send_webhook(self.sess, "session_end",
+                         extra={"turns": len(self.history)})
+            if self.task:
+                self.run_task()
+            # доставка итога в основную сессию Hermes (#1) — только после реального диалога
+            if (self.task or self.consensus) and self.history:
+                self.deliver_summary()
+        except Exception as e:
+            # любой сбой — сессия помечается interrupted, данные не теряются
+            if self.sess is not None:
+                self._interrupt(f"исключение: {e}")
+            raise
 
     def run_task(self):
         """Режим «дискуссия → задачка»: итог диалога + задача → Hermes, результат [EXEC]."""
@@ -289,7 +573,8 @@ class Dialogue:
                   f"Контекст дискуссии (итог обсуждения):\n{hist}\n"
                   "Дай практический результат по задаче, опираясь на контекст. "
                   "Отвечай по-русски, конкретно и по делу.")
-        ok, out, err = call_model("hermes", prompt, EXEC_TIMEOUT, self.stop)
+        ok, out, err = call_model("hermes", prompt, EXEC_TIMEOUT, self.stop,
+                                  self.sess["session_id"] if self.sess else None)
         if not ok:
             self.on_event("warn", "⚠", f"[EXEC] не выполнен: {err}")
             return
@@ -299,10 +584,16 @@ class Dialogue:
             return
         self.on_event("exec", None, text)
         self.exec_done = True
+        self._save()
+        if self.sess:
+            log_write(self.sess["session_id"], "info",
+                      f"[EXEC]: {text[:200]}")
+            send_webhook(self.sess, "exec", text=text)
 
     def build_summary(self):
         """Краткая практичная сводка дискуссии (для основной сессии)."""
-        parts = [f"тема «{self.topic}»", f"{len(self.history)} ходов"]
+        parts = [f"сессия {self.sess['session_id']}" if self.sess else "",
+                 f"тема «{self.topic}»", f"{len(self.history)} ходов"]
         if self.history:
             last = " ".join(self.history[-1][1].split())
             if len(last) > SUMMARY_MAX:
@@ -310,7 +601,7 @@ class Dialogue:
             parts.append(f"итог: {last}")
         if self.exec_done:
             parts.append("задача выполнена ([EXEC])")
-        return " · ".join(parts)
+        return " · ".join(p for p in parts if p)
 
     def deliver_summary(self):
         """Итог дискуссии → основная сессия Hermes (#1), чтобы Hermes видел результат."""
@@ -321,13 +612,22 @@ class Dialogue:
                           "итог отправлен в основную сессию Hermes (#1)")
 
 
-def run_headless(topic, turns, task=None, consensus=False):
+def run_headless(topic, turns, task=None, consensus=False, session_id=None,
+                 quiet=False):
     """Прогон без UI: печатает диалог в stdout. Возвращает код выхода."""
     print(f"arena_chat {__version__} · тема «{topic}»"
-          f" · режим: {'до согласия' if consensus else f'до {turns} ходов'}")
+          f" · режим: {'до согласия' if consensus else f'до {turns} ходов'}"
+          + (f" · resume {session_id}" if session_id else ""))
     stop = threading.Event()
     ev = queue.Queue()
-    d = Dialogue(topic, turns, lambda k, t, x, turn=None: ev.put((k, t, x, turn)), stop, task, consensus)
+    try:
+        d = Dialogue(topic, turns,
+                     lambda k, t, x, turn=None: ev.put((k, t, x, turn)),
+                     stop, task, consensus, session_id=session_id,
+                     quiet=quiet)
+    except ValueError as e:
+        print(f"⚠ {e}")
+        return 2
     d.run()
     n = 0
     e = 0
@@ -337,7 +637,11 @@ def run_headless(topic, turns, task=None, consensus=False):
         if k == "msg":
             n += 1
             who = "HERMES" if t == "hermes" else "OMP"
-            print(f"\n[{who}] ход {turn} ({now_ts()}):\n{x}")
+            if quiet:
+                one = " ".join(x.split())
+                print(f"{turn:>3} {who:<6} {now_ts()} | {one[:100]}")
+            else:
+                print(f"\n[{who}] ход {turn} ({now_ts()}):\n{x}")
         elif k == "exec":
             e += 1
             print(f"\n[EXEC] ({now_ts()}):\n{x}")
@@ -355,6 +659,77 @@ def run_headless(topic, turns, task=None, consensus=False):
         tail += f", {e} задача выполнена"
     print(f"\n--- итог: {n} ходов{tail} ---")
     return 0 if n >= 1 else 1
+
+
+def selftest_drop():
+    """АВТОТЕСТ ОБРЫВА СЕССИИ (критерий приёмки v0.0.7):
+    1) диалог на 2 хода с имитацией обрыва (статус остаётся running);
+    2) resume по session_id — продолжение без потерь и дублей контекста;
+    3) проверка: 4 хода, номера уникальны, тексты ходов 1–2 сохранены."""
+    print(f"arena_chat {__version__} · selftest-drop (обрыв сессии)")
+    sid = None
+    try:
+        stop = threading.Event()
+        ev = queue.Queue()
+        d1 = Dialogue("Самопроверка обрыва сессии", 4,
+                      lambda k, t, x, turn=None: ev.put((k, t, x, turn)),
+                      stop, None, False, crash_after=2)
+        d1.run()
+        sid = d1.sess["session_id"] if d1.sess else None
+        if not sid:
+            print("FAIL: сессия не создана")
+            return 1
+        sess = load_session(sid)
+        if sess.get("status") != "running":
+            print(f"FAIL: статус после обрыва = {sess.get('status')}, "
+                  f"ожидался running")
+            return 1
+        if sess.get("turns") != 2 or len(sess.get("history", [])) != 2:
+            print(f"FAIL: после обрыва {sess.get('turns')} ходов, "
+                  f"ожидалось 2")
+            return 1
+        saved_first = [h["text"] for h in sess["history"]]
+        print(f"обрыв имитирован: сессия {sid}, 2 хода, status=running")
+
+        stop2 = threading.Event()
+        ev2 = queue.Queue()
+        d2 = Dialogue("", 4,
+                      lambda k, t, x, turn=None: ev2.put((k, t, x, turn)),
+                      stop2, None, False, session_id=sid)
+        d2.run()
+        sess2 = load_session(sid)
+        if sess2.get("status") != "completed":
+            print(f"FAIL: после resume статус = {sess2.get('status')}, "
+                  f"ожидался completed")
+            return 1
+        turns_n = [h["turn"] for h in sess2.get("history", [])]
+        texts = [h["text"] for h in sess2.get("history", [])]
+        if turns_n != [1, 2, 3, 4]:
+            print(f"FAIL: номера ходов {turns_n}, ожидались [1,2,3,4]")
+            return 1
+        if len(set(texts)) != 4:
+            print("FAIL: есть дубли текстов (контекст задублирован)")
+            return 1
+        if texts[:2] != saved_first:
+            print("FAIL: тексты ходов 1–2 не совпадают с сохранёнными "
+                  "(потеря контекста)")
+            return 1
+        print(f"resume OK: {sid} → 4 хода [1..4], без потерь и дублей")
+        print("SELFTEST DROP: PASS")
+        return 0
+    except Exception as e:
+        print(f"SELFTEST DROP: FAIL ({e})")
+        return 1
+
+
+def session_info(session_id):
+    """Машиночитаемые метаданные сессии (протокол v1) в stdout."""
+    sess = load_session(session_id)
+    if sess is None:
+        print(f"сессия {session_id} не найдена в {sessions_dir()}")
+        return 1
+    print(json.dumps(sess, ensure_ascii=False, indent=2))
+    return 0
 
 
 # ─────────────────────────── UI (urwid) ───────────────────────────
@@ -526,11 +901,34 @@ def main():
                     help="задача после диалога (режим «дискуссия → задачка»)")
     ap.add_argument("--consensus", action="store_true",
                     help="режим «до согласия»: до согласованного вывода, потолок 30 ходов")
+    ap.add_argument("--resume", metavar="SESSION_ID", default=None,
+                    help="восстановить сессию по session_id (протокол v1)")
+    ap.add_argument("--quiet", action="store_true",
+                    help="компактный вывод в stdout (полный текст — в лог-файл)")
+    ap.add_argument("--log-level", choices=["info", "debug"], default=None,
+                    help="уровень лог-файла (по умолчанию ARENA_LOG_LEVEL=info)")
+    ap.add_argument("--webhook", metavar="URL", default=None,
+                    help="вебхук событий (перекрывает ARENA_WEBHOOK_URL)")
+    ap.add_argument("--session-info", metavar="SESSION_ID", default=None,
+                    help="машиночитаемые метаданные сессии (JSON) и выход")
+    ap.add_argument("--selftest-drop", action="store_true",
+                    help="автотест обрыва сессии: 2 хода → обрыв → resume → проверка")
     ap.add_argument("--smoke", action="store_true", help="смоук-тест UI (сам стартует и выходит)")
     args = ap.parse_args()
 
+    global LOG_LEVEL, WEBHOOK_URL
+    if args.log_level:
+        LOG_LEVEL = args.log_level
+    if args.webhook:
+        WEBHOOK_URL = args.webhook
+
+    if args.session_info:
+        sys.exit(session_info(args.session_info))
+    if args.selftest_drop:
+        sys.exit(selftest_drop())
     if args.headless:
-        sys.exit(run_headless(args.headless, args.turns, args.task, args.consensus))
+        sys.exit(run_headless(args.headless, args.turns, args.task,
+                              args.consensus, args.resume, args.quiet))
 
     loop = make_ui("—", args.turns,
                    lambda k, t, x, turn=None: None,

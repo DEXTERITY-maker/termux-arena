@@ -44,6 +44,8 @@ import sys
 import threading
 import time
 
+__version__ = "0.0.5"
+
 def env_str(name, default, maxlen=512):
     """Переменная окружения с санитизацией: strip, лимит длины; пустое или
     слишком длинное значение → безопасный дефолт. Токены/пути не зашиваются —
@@ -321,6 +323,8 @@ class Dialogue:
 
 def run_headless(topic, turns, task=None, consensus=False):
     """Прогон без UI: печатает диалог в stdout. Возвращает код выхода."""
+    print(f"arena_chat {__version__} · тема «{topic}»"
+          f" · режим: {'до согласия' if consensus else f'до {turns} ходов'}")
     stop = threading.Event()
     ev = queue.Queue()
     d = Dialogue(topic, turns, lambda k, t, x, turn=None: ev.put((k, t, x, turn)), stop, task, consensus)
@@ -384,7 +388,7 @@ def make_ui(topic, turns, on_event, stop_event, smoke=False):
         log_walker.append(w)
         log_box.set_focus(len(log_walker) - 1)
 
-    header_text = urwid.Text(("topic", f"ARENA  Hermes ↔ OMP    тема: «{topic}»    ходы: {turns}"))
+    header_text = urwid.Text(("topic", f"ARENA v{__version__}  Hermes ↔ OMP    тема: «{topic}»    ходы: {turns}"))
     header = urwid.LineBox(header_text, title="╭─ ARENA ─╮", title_attr="frame")
 
     status_text = urwid.Text(("status", "готов · /start <тема> · /turns N · /stop · /clear · /quit"))
@@ -514,6 +518,8 @@ def main():
     active_task = None
     arena_mode = "turns"
     ap = argparse.ArgumentParser(description="Арена двух моделей: Hermes ↔ OMP")
+    ap.add_argument("--version", action="version",
+                    version=f"arena_chat {__version__}")
     ap.add_argument("--headless", metavar="ТЕМА", help="прогон без UI (печать диалога)")
     ap.add_argument("--turns", type=int, default=DEFAULT_MAX_TURNS, help="лимит ходов")
     ap.add_argument("--task", metavar="ЗАДАЧА", default=None,

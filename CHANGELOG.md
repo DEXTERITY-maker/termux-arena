@@ -5,6 +5,12 @@
 Формат основан на [Keep a Changelog](https://keepachangelog.com/ru/1.1.0/),
 проект придерживается [Semantic Versioning](https://semver.org/lang/ru/).
 
+## [Unreleased]
+
+### Added
+- Субагенты (ревьюеры, делегации) — видимые tmux-сессии: `scripts/subagent_tmux.sh` (правило владельца)
+- Панель штурма/субагента держится 10 минут после завершения (итог виден, лог в `~/.hermes/cache/`)
+
 ## [0.0.8] — 2026-08-10
 
 ### Added

@@ -25,6 +25,6 @@ while tmux has-session -t "$SESS" 2>/dev/null; do
 done
 
 # printf %q — shell-safe кавычки темы; extra args (--turns N, --consensus, …) передаются как есть
-CMD="python3 ~/.hermes/arena_chat.py --headless $(printf '%q' "$TOPIC") $*"
+CMD="python3 ~/.hermes/arena_chat.py --headless $(printf '%q' "$TOPIC") $*; echo; echo '===ШТУРМ ЗАВЕРШЁН (итог выше)==='; sleep 600"
 tmux new-session -d -s "$SESS" "$CMD"
 echo "штурм запущен: tmux-сессия $SESS (смотреть: tmux attach -t $SESS)"

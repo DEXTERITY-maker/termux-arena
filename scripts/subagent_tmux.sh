@@ -33,6 +33,8 @@ done
 LOG="$HOME/.hermes/cache/subagent-$SAFE.log"
 mkdir -p "$HOME/.hermes/cache"
 TASKQ=$(printf '%q' "$TASK")
-CMD="hermes chat -q $TASKQ -Q $* 2>&1 | tee $LOG; echo; echo '===СУБАГЕНТ ЗАВЕРШЁН (итог выше, лог: $LOG)==='; sleep 600"
+ARGSQ=""
+for a in "$@"; do ARGSQ+="$(printf '%q ' "$a")"; done
+CMD="hermes chat -q $TASKQ -Q $ARGSQ 2>&1 | tee $LOG; echo; echo '===СУБАГЕНТ ЗАВЕРШЁН (итог выше, лог: $LOG)==='; sleep 600"
 tmux new-session -d -s "$SESS" "$CMD"
 echo "субагент запущен: tmux-сессия $SESS (смотреть: tmux attach -t $SESS; лог: $LOG)"

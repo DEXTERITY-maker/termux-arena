@@ -72,7 +72,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-__version__ = "0.0.8"
+__version__ = "0.0.9"
 
 PROTOCOL_NAME = "arena-protocol"
 PROTOCOL_VERSION = 1
@@ -181,7 +181,7 @@ def hermes_session_clear():
 
 def parse_hermes_session(out):
     """session_id из вывода `hermes chat -Q` (после первого запуска)."""
-    m = re.search(r"session[:_\s]*([0-9]{8}_[0-9]{6}_[0-9a-fA-F]{6})",
+    m = re.search(r"session_?id\s*[:=]?\s*([0-9]{8}_[0-9]{6}_[0-9a-fA-F]{6})",
                   out or "")
     if m:
         return m.group(1)
@@ -291,7 +291,7 @@ def match_final_marker(text):
     for m in FINAL_MARKERS:
         if low.startswith(m):
             rest = low[len(m):]
-            if not rest or rest[0] in ":!.,»)\"'…— ":
+            if not rest or rest[0] in ":!.,»)\"'…—":
                 return m
     return None
 
@@ -487,6 +487,7 @@ def send_webhook(sess, event, model=None, turn=None, text=None, extra=None):
     недоступном вебхуке. Headless дожидается потоков после диалога."""
     if not WEBHOOK_URL:
         return
+    _WEBHOOK_THREADS[:] = [t for t in _WEBHOOK_THREADS if t.is_alive()]
     t = threading.Thread(target=_webhook_post,
                          args=(sess, event, model, turn, text, extra),
                          daemon=True)
@@ -525,6 +526,8 @@ class Dialogue:
             raise ValueError(f"некорректный session_id: {session_id!r}")
         sess = load_session(session_id)
         if sess is None:
+            if os.path.exists(session_path(session_id)):
+                raise ValueError(f"сессия {session_id}: повреждён файл сессии")
             raise ValueError(f"сессия {session_id} не найдена в {sessions_dir()}")
         if sess.get("status") == "completed":
             raise ValueError(f"сессия {session_id} уже завершена — начните новую")

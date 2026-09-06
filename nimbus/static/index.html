@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Nimbus AI — чат с моделями</title>
+<link rel="stylesheet" href="/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>☁️</text></svg>">
+</head>
+<body>
+<aside id="sidebar">
+  <div class="brand"><span class="logo">☁</span><div><b>Nimbus AI</b><small>чат с моделями</small></div></div>
+  <button id="newChat" class="primary">+ Новый чат</button>
+  <div class="label">История</div>
+  <div id="chatList"></div>
+  <div class="spacer"></div>
+  <div class="label">Модель</div>
+  <select id="model"></select>
+  <div id="modelDesc" class="hint"></div>
+  <div class="label">Системный промпт</div>
+  <textarea id="system" rows="3" placeholder="Ты — полезный ассистент."></textarea>
+  <div id="tempRow">
+    <div class="label">Температура <span id="tempVal">0.7</span></div>
+    <input id="temp" type="range" min="0" max="2" step="0.1" value="0.7">
+  </div>
+  <div id="keyState" class="hint"></div>
+</aside>
+
+<main>
+  <header>
+    <button id="menuBtn" class="icon">☰</button>
+    <div id="title">Новый чат</div>
+    <button id="clearBtn" class="icon" title="Очистить">🗑</button>
+  </header>
+  <div id="messages">
+    <div class="empty">
+      <div class="empty-logo">☁</div>
+      <h1>Nimbus AI</h1>
+      <p>Общайтесь с моделями DeepSeek. Выберите модель слева и задайте вопрос.</p>
+      <div class="chips">
+        <button class="chip">Объясни квантовую запутанность простыми словами</button>
+        <button class="chip">Напиши bash-скрипт бэкапа папки</button>
+        <button class="chip">Придумай план изучения Python на месяц</button>
+      </div>
+    </div>
+  </div>
+  <form id="composer">
+    <textarea id="input" rows="1" autofocus placeholder="Спросите что-нибудь…  (Enter — отправить, Shift+Enter — перенос)"></textarea>
+    <button id="send" type="submit" title="Отправить">➤</button>
+  </form>
+</main>
+<div id="scrim"></div>
+<script src="/util.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

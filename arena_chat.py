@@ -14,7 +14,8 @@ Resume:         python3 ~/.hermes/arena_chat.py --headless "тема" --resume <
 Метаданные:     python3 ~/.hermes/arena_chat.py --session-info <session_id>
 Автотест:       python3 ~/.hermes/arena_chat.py --selftest-drop
 
-Команды: /start <тема> · /stop · /turns N · /task <задача> · /consensus · /clear · /status · /quit
+Команды: /start <тема> · /stop · /turns N · /task <задача> · /consensus · /resume <id> ·
+         /sessions · /export <id|last> · /clear · /status · /quit
 
 Протокол v1 (v0.0.7): каждая сессия сохраняется в ~/arena_sessions/<id>.json
 (topic/participants/status/history) после каждого хода — восстановление по
@@ -56,6 +57,8 @@ session_id хранится в <ARENA_HOME>/arena_hermes_session, дальше �
   ARENA_OMP_SYSTEM_PROMPT — системный промпт OMP
   ARENA_WEBHOOK_URL       — вебхук событий (пусто = выключен)
   ARENA_LOG_LEVEL         — уровень лог-файла: info | debug (info)
+  ARENA_PRUNE_DAYS        — авто-удаление сессий/логов старше N дней (30, 0 = выкл)
+  ARENA_HEALTHCHECK_URL   — URL проверки сети перед стартом (https://api.github.com)
 """
 
 import argparse
@@ -76,18 +79,21 @@ __version__ = "0.0.11"
 
 # P0.3: проверка версий зависимостей при старте
 def _check_deps():
-    """Проверяет наличие и версии urwid/telethon. При несовпадении —
-    печатает понятную ошибку в stderr и возвращает False."""
+    """Проверяет наличие и версии зависимостей. urwid обязателен (UI),
+    telethon — опционален (нужен только tg_login.py): его отсутствие не
+    считается ошибкой и не выводится. При несовпадении версии — предупреждение
+    в stderr. Возвращает False, если не хватает обязательной зависимости."""
     ok = True
-    deps = {"urwid": "4.0.8", "telethon": "1.44.0"}
-    for pkg, want in deps.items():
+    deps = {"urwid": ("4.0.8", True), "telethon": ("1.44.0", False)}
+    for pkg, (want, required) in deps.items():
         try:
             mod = __import__(pkg)
             have = getattr(mod, "__version__", None)
         except ImportError:
-            print(f"ARENA: не установлен {pkg}. Установите: pip install {pkg}=={want}",
-                  file=sys.stderr)
-            ok = False
+            if required:
+                print(f"ARENA: не установлен {pkg}. Установите: pip install {pkg}=={want}",
+                      file=sys.stderr)
+                ok = False
             continue
         if have is None:
             continue   # нет __version__ — не проверяем
@@ -304,15 +310,23 @@ def call_model(kind, text, timeout, stop_event=None, session_id=None):
 
 # ── P2.7: network healthcheck ──
 
+HEALTHCHECK_URL = env_str("ARENA_HEALTHCHECK_URL", "https://api.github.com",
+                          maxlen=2048)
+
+
 def network_ok(timeout=3):
-    """Быстрая проверка доступности сети (curl api.telegram.org)."""
+    """Быстрая проверка доступности сети: HEAD-запрос на ARENA_HEALTHCHECK_URL
+    через curl. Любой HTTP-ответ означает, что сеть есть; если curl не
+    установлен — считаем сеть доступной (не блокируем запуск)."""
     try:
         r = subprocess.run(
-            ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-             "https://api.telegram.org", "--max-time", str(timeout)],
+            ["curl", "-sI", "-o", "/dev/null", "-w", "%{http_code}",
+             HEALTHCHECK_URL, "--max-time", str(timeout)],
             capture_output=True, text=True, timeout=timeout + 2)
         code = r.stdout.strip()
-        return code in ("200", "301", "302", "404")
+        return code.isdigit() and code != "000"
+    except FileNotFoundError:
+        return True
     except Exception:
         return False
 

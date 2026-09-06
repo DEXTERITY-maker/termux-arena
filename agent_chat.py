@@ -1,11 +1,11 @@
+#!/data/data/com.termux/files/usr/bin/python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 — Termux Arena. См. LICENSE.
-
-#!/data/data/com.termux/files/usr/bin/python3
+#
 # agent_chat.py — AGENT ARENA: Пользователь | Hermes | OMP | Dao
 # Каналы:
-#   → Hermes : tmux send-keys в hermes-chat
-#   → OMP    : tmux send-keys в rk_omp_chat_8e939621 (или omp-chat)
+#   → Hermes : tmux send-keys в hermes-chat (ARENA_MAIN_SESSION)
+#   → OMP    : tmux send-keys в omp-chat (ARENA_OMP_SESSION), иначе автопоиск сессии omp
 #   → Dao    : append в dao_inbox.md + флаг
 # Команды: @h (Hermes) | @o (OMP) | @d (Dao) | @auto (автодиалог Hermes↔OMP) | @quit
 # Обычный текст = Hermes'у.
@@ -15,8 +15,8 @@ import subprocess
 import os
 import time
 
-HERMES_SESSION = "hermes-chat"
-OMP_SESSION    = "rk_omp_chat_efb690b2"
+HERMES_SESSION = os.environ.get("ARENA_MAIN_SESSION", "hermes-chat")
+OMP_SESSION    = os.environ.get("ARENA_OMP_SESSION", "omp-chat")   # при пустой панели ищется автоматически
 DAO_INBOX      = os.path.expanduser("~/.hermes/dao_inbox.md")
 DAO_FLAG       = os.path.expanduser("~/.hermes/hermes_inbox.flag")
 AUTO_STATE     = os.path.expanduser("~/.hermes/agent_auto.state")

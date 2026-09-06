@@ -19,8 +19,10 @@
   <div id="modelDesc" class="hint"></div>
   <div class="label">Системный промпт</div>
   <textarea id="system" rows="3" placeholder="Ты — полезный ассистент."></textarea>
-  <div class="label">Температура <span id="tempVal">0.7</span></div>
-  <input id="temp" type="range" min="0" max="2" step="0.1" value="0.7">
+  <div id="tempRow">
+    <div class="label">Температура <span id="tempVal">0.7</span></div>
+    <input id="temp" type="range" min="0" max="2" step="0.1" value="0.7">
+  </div>
   <div id="keyState" class="hint"></div>
 </aside>
 
@@ -43,11 +45,12 @@
     </div>
   </div>
   <form id="composer">
-    <textarea id="input" rows="1" placeholder="Спросите что-нибудь…  (Enter — отправить, Shift+Enter — перенос)"></textarea>
+    <textarea id="input" rows="1" autofocus placeholder="Спросите что-нибудь…  (Enter — отправить, Shift+Enter — перенос)"></textarea>
     <button id="send" type="submit" title="Отправить">➤</button>
   </form>
 </main>
 <div id="scrim"></div>
+<script src="/util.js"></script>
 <script src="/app.js"></script>
 </body>
 </html>

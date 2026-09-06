@@ -80,3 +80,8 @@ details.think summary{cursor:pointer;color:var(--accent)}
   #menuBtn{display:block}
   .empty{margin:8vh auto}
 }
+
+#tempRow input:disabled{cursor:not-allowed}
+#chatList .chat-item b{cursor:pointer;padding:0 4px}
+#chatList .chat-item b:hover{opacity:1;color:#ff7b72}
+.msg.user .content{white-space:pre-wrap}

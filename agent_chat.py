@@ -46,7 +46,7 @@ def find_omp_session():
         out = sh("for p in $(pgrep -f 'oh-my-pi/omp'); do t=$(readlink /proc/$p/fd/0 2>/dev/null); case \"$t\" in /dev/pts/*) echo \"$t\"; break;; esac; done")
         tty = out.strip()
         if tty:
-            ses = sh(f"tmux list-panes -a -F '#{{session_name}} {{pane_tty}}' 2>/dev/null | awk -v t='{tty}' '{{ if ($2 == t) print $1 }}'").strip()
+            ses = sh(f"tmux list-panes -a -F '#{{session_name}} #{{pane_tty}}' 2>/dev/null | awk -v t='{tty}' '{{ if ($2 == t) print $1 }}'").strip()
             if ses:
                 return ses.split("\n")[0]
     except Exception:

@@ -1,12 +1,13 @@
+#!/data/data/com.termux/files/usr/bin/python3
 # SPDX-License-Identifier: MIT
 # Copyright (c) 2026 — Termux Arena. См. LICENSE.
-
-#!/data/data/com.termux/files/usr/bin/python3
+#
 # tg_login.py — вход в Telegram через MTProto (telethon) без пароля.
 # Использование: python3 ~/.hermes/tg_login.py <номер_телефона>
 # Ввод кода — интерактивный; сессия сохраняется в ~/.hermes/tg_session.session
 import asyncio, sys, os
 from telethon import TelegramClient
+from telethon.errors import SessionPasswordNeededError
 
 def load_env():
     env = {}
@@ -40,8 +41,10 @@ async def main():
     code = input("code: ").strip()
     try:
         await client.sign_in(phone, code)
-    except Exception as e:
-        print(f"Нужен пароль 2FA: {e}")
+    except SessionPasswordNeededError:
+        # только реальный 2FA; неверный код/номер — падают с понятной ошибкой,
+        # а не уводят в запрос пароля
+        print("Включена двухфакторная защита — нужен облачный пароль.")
         pwd = input("password: ").strip()
         await client.sign_in(password=pwd)
     me = await client.get_me()

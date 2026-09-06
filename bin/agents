@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# agents — единый CLI: выбор агента (Hermes / OMP / Арена)
-# Использование: agents [hermes|omp|arena|status|quit]
+# agents — единый CLI: выбор агента (Hermes / OMP / Арена / Монитор)
+# Использование: agents [hermes|omp|arena|monitor|status|quit]
 
 find_ses() { # $1=процесс-паттерн $2=дефолтная сессия
   local p tty found
@@ -29,9 +29,10 @@ if [ -n "$1" ]; then
   case "$1" in
     hermes|h) start_or_attach "usr/bin/hermes" "hermes" "hermes-chat" ;;
     omp|o)    start_or_attach "oh-my-pi/omp" "omp" "omp-chat" ;;
-    arena|a)  start_or_attach "agent_chat.py" "python3 ~/.hermes/agent_chat.py" "arena" ;;
+    arena|a)  start_or_attach "arena_chat.py" "python3 ~/.hermes/arena_chat.py" "arena" ;;
+    monitor|m) start_or_attach "agent_chat.py" "python3 ~/.hermes/agent_chat.py" "arena-monitor" ;;
     status|s) tmux ls 2>&1 ;;
-    *) echo "agents [hermes|omp|arena|status]"; tmux ls 2>&1 ;;
+    *) echo "agents [hermes|omp|arena|monitor|status]"; tmux ls 2>&1 ;;
   esac
   exit 0
 fi
@@ -41,16 +42,18 @@ while true; do
   echo "╭── AGENTS CLI ──────────────────────────────╮"
   echo "│  1) ⚕ Hermes    — агент публикаций         │"
   echo "│  2) π OMP       — агент (DeepSeek V4 Pro)  │"
-  echo "│  3) ⚡ Арена     — Hermes | OMP (вместе)    │"
-  echo "│  4) 📋 Статус сессий                       │"
+  echo "│  3) ⚡ Арена     — автодиалог Hermes ↔ OMP  │"
+  echo "│  4) 🖥 Монитор   — панели tmux-сессий       │"
+  echo "│  5) 📋 Статус сессий                       │"
   echo "│  0) Выход                                  │"
   echo "╰─────────────────────────────────────────────╯"
   read -p "Выбор: " c
   case "$c" in
     1|hermes) start_or_attach "usr/bin/hermes" "hermes" "hermes-chat" ;;
     2|omp)    start_or_attach "oh-my-pi/omp" "omp" "omp-chat" ;;
-    3|arena)  start_or_attach "agent_chat.py" "python3 ~/.hermes/agent_chat.py" "arena" ;;
-    4|status) tmux ls 2>&1; sleep 1 ;;
+    3|arena)  start_or_attach "arena_chat.py" "python3 ~/.hermes/arena_chat.py" "arena" ;;
+    4|monitor) start_or_attach "agent_chat.py" "python3 ~/.hermes/agent_chat.py" "arena-monitor" ;;
+    5|status) tmux ls 2>&1; sleep 1 ;;
     0|q) echo "Пока"; exit 0 ;;
     *) echo "Неверный выбор" ;;
   esac

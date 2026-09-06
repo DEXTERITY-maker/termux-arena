@@ -67,6 +67,7 @@ import json
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -225,6 +226,23 @@ def _is_missing_session(err):
             or "no such session" in low)
 
 
+def _kill_proc(p):
+    """Убить подпроцесс вместе с его потомками (группа процессов: hermes/omp
+    запускают дочерние node/python, которые иначе держат пайпы открытыми)
+    и корректно освободить пайпы — без исключений."""
+    try:
+        os.killpg(p.pid, signal.SIGKILL)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    try:
+        p.communicate(timeout=5)
+    except Exception:
+        pass
+
+
 def call_model(kind, text, timeout, stop_event=None, session_id=None):
     """Программный вызов модели. Возвращает (ok, stdout, err).
     Ретраи с экспоненциальной задержкой (2,4,8 с); для omp при окончательном
@@ -255,46 +273,50 @@ def call_model(kind, text, timeout, stop_event=None, session_id=None):
         log_write(session_id, "debug",
                   f"вызов {label} (попытка {attempts.index(attempt) + 1}/"
                   f"{len(attempts)})…")
+        use_stdin = (kind == "omp")
         try:
-            use_stdin = (kind == "omp")
             p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE,
                                  stdin=subprocess.PIPE if use_stdin else None,
-                                 text=True, cwd=HOME)
-            if use_stdin:
-                p.stdin.write(text + "\n")
-                p.stdin.close()
+                                 text=True, cwd=HOME,
+                                 start_new_session=True)
         except Exception as e:
             last_err = str(e)
             continue
+        # Чтение вывода — через communicate(timeout=…) в цикле: stdout/stderr
+        # вычитываются постоянно, поэтому модель с длинным выводом (>64 КБ,
+        # размер буфера пайпа) не блокируется и не получает ложный таймаут.
+        # stdin для omp передаётся как input (закрывает сам communicate).
+        pending = (text + "\n") if use_stdin else None
         start = time.time()
+        out, err, rc = "", "", None
         while True:
             if stop_event is not None and stop_event.is_set():
-                p.kill()
-                p.communicate()
+                _kill_proc(p)
                 return False, "", "остановлено по /stop"
-            rc = p.poll()
-            if rc is not None:
-                out, err = p.communicate()
-                if rc == 0:
-                    if kind == "hermes":
-                        nsid = (parse_hermes_session(out)
-                                or parse_hermes_session(err))
-                        if nsid:
-                            hermes_session_write(nsid)
-                    return True, out, err
-                last_err = err.strip() or f"exit {rc}"
-                if kind == "hermes" and resume_sid \
-                   and _is_missing_session(err):
-                    hermes_session_clear()
-                    resume_sid = None   # следующая попытка — новая сессия
+            try:
+                out, err = p.communicate(input=pending, timeout=0.25)
+                rc = p.returncode
                 break
+            except subprocess.TimeoutExpired:
+                pending = None   # ввод уже передан при первом вызове
             if time.time() - start > timeout:
-                p.kill()
-                p.communicate()
+                _kill_proc(p)
                 last_err = f"таймаут {timeout}с"
                 break
-            time.sleep(0.2)
+        if rc is not None:
+            if rc == 0:
+                if kind == "hermes":
+                    nsid = (parse_hermes_session(out)
+                            or parse_hermes_session(err))
+                    if nsid:
+                        hermes_session_write(nsid)
+                return True, out, err
+            last_err = (err or "").strip() or f"exit {rc}"
+            if kind == "hermes" and resume_sid \
+               and _is_missing_session(err):
+                hermes_session_clear()
+                resume_sid = None   # следующая попытка — новая сессия
         if attempt != attempts[-1]:
             delay = RETRY_BACKOFF[min(attempts.index(attempt),
                                       len(RETRY_BACKOFF) - 1)]
@@ -450,6 +472,14 @@ def logs_dir():
 
 def session_path(session_id):
     return os.path.join(sessions_dir(), f"{session_id}.json")
+
+
+def list_session_files():
+    """JSON-файлы сессий, отсортированные по времени изменения (старые →
+    новые). Имена сессий — случайный hex, сортировка по имени бессмысленна."""
+    import glob as _glob
+    files = _glob.glob(os.path.join(sessions_dir(), "*.json"))
+    return sorted(files, key=lambda f: os.path.getmtime(f) if os.path.exists(f) else 0)
 
 
 def new_session_id():
@@ -686,7 +716,9 @@ class Dialogue:
         self.call_fn = call_fn or call_model  # хук вызова модели (selftest мокает)
         self.sess = None                # метаданные протокола v1
         self.history = []
+        self.history_ts = []            # время каждого хода (не перезаписывается при _save)
         self.exec_done = False          # задача реально выполнена ([EXEC] отдан)
+        self.retry_exec_only = False    # resume завершённой сессии с невыполненной задачей
         self.base_turns = 0             # ходов уже было до этого запуска (resume)
         if session_id:
             self._load(session_id)
@@ -701,7 +733,9 @@ class Dialogue:
             if os.path.exists(session_path(session_id)):
                 raise ValueError(f"сессия {session_id}: повреждён файл сессии")
             raise ValueError(f"сессия {session_id} не найдена в {sessions_dir()}")
-        if sess.get("status") == "completed":
+        if sess.get("status") == "completed" and not (
+                sess.get("task") and not sess.get("exec_done")):
+            # completed с невыполненной задачей — можно повторить только [EXEC]
             raise ValueError(f"сессия {session_id} уже завершена — начните новую")
         if sess.get("protocol_version") != PROTOCOL_VERSION:
             raise ValueError(f"несовместимая версия протокола: "
@@ -712,14 +746,18 @@ class Dialogue:
         self.consensus = sess.get("mode") == "consensus"
         self.max_turns = sess.get("max_turns", self.max_turns)
         self.history = history_from_sess(sess)
+        self.history_ts = [h.get("ts", "") for h in sess.get("history", [])]
         self.base_turns = len(self.history)
+        self.retry_exec_only = (sess.get("status") == "completed")
         self.sess["status"] = "running"   # обрыв → продолжаем
 
     def _save(self, final_marker=None):
         if self.sess is None:
             return
+        while len(self.history_ts) < len(self.history):
+            self.history_ts.append(now_ts())
         self.sess["history"] = [
-            {"turn": i + 1, "model": m, "ts": now_ts(), "text": t}
+            {"turn": i + 1, "model": m, "ts": self.history_ts[i], "text": t}
             for i, (m, t) in enumerate(self.history)
         ]
         self.sess["turns"] = len(self.history)
@@ -735,6 +773,9 @@ class Dialogue:
         self._save()
         log_write(self.sess["session_id"], "warn", f"прервано: {reason}")
         send_webhook(self.sess, "session_interrupt", extra={"reason": reason})
+        self.on_event("status", None,
+                      f"прервано ({reason}) · {len(self.history)} ходов · "
+                      f"продолжить: /resume {self.sess['session_id']}")
 
     # ── основной цикл ──
 
@@ -759,7 +800,11 @@ class Dialogue:
                               f"возобновлено: {self.base_turns} ходов из "
                               f"сессии {self.sess['session_id']}")
             turns = CONSENSUS_MAX if self.consensus else self.max_turns
-            final_marker = None
+            final_marker = self.sess.get("final_marker")
+            if self.retry_exec_only:
+                turns = self.base_turns   # диалог не продолжаем — только задача
+                self.on_event("status", None,
+                              f"сессия завершена, задача не была выполнена — повтор [EXEC]")
             for i in range(self.base_turns, turns):
                 if self.stop.is_set():
                     self.on_event("warn", "⏹", "Диалог остановлен по /stop")
@@ -828,7 +873,9 @@ class Dialogue:
                     return
                 if i < turns - 1:
                     time.sleep(PAUSE)
-            if self.consensus:
+            if self.retry_exec_only:
+                pass
+            elif self.consensus:
                 if final_marker:
                     self.on_event("status", None,
                                   f"диалог завершён: согласованный вывод (маркер «{final_marker}»)")
@@ -856,6 +903,15 @@ class Dialogue:
                     self._interrupt(f"исключение: {e}")
                 except Exception:
                     pass   # не маскировать исходное исключение
+            # сообщить в UI/headless: иначе поток тихо умирает, а статус-бар
+            # навсегда остаётся на «… думает…»
+            try:
+                self.on_event("warn", "💥",
+                              f"внутренняя ошибка движка: {type(e).__name__}: {e} "
+                              f"— сессия сохранена, продолжить: /resume "
+                              f"{self.sess['session_id'] if self.sess else '?'}")
+            except Exception:
+                pass
             raise
 
     def run_task(self):
@@ -868,12 +924,13 @@ class Dialogue:
                   "Отвечай по-русски, конкретно и по делу.")
         ok, out, err = self.call_fn("hermes", prompt, EXEC_TIMEOUT, self.stop,
                                     self.sess["session_id"] if self.sess else None)
+        sid = self.sess["session_id"] if self.sess else "?"
         if not ok:
-            self.on_event("warn", "⚠", f"[EXEC] не выполнен: {err}")
+            self.on_event("warn", "⚠", f"[EXEC] не выполнен: {err} — повторить: --resume {sid}")
             return
         text = clean(out)
         if not text:
-            self.on_event("warn", "⚠", "[EXEC] вернул пустой ответ")
+            self.on_event("warn", "⚠", f"[EXEC] вернул пустой ответ — повторить: --resume {sid}")
             return
         self.on_event("exec", None, text)
         self.exec_done = True
@@ -953,11 +1010,14 @@ def export_session_md(session_id_or_path, out_dir=None):
 
 def run_headless(topic, turns, task=None, consensus=False, session_id=None,
                  quiet=False):
-    """Прогон без UI: печатает диалог в stdout. Возвращает код выхода."""
+    """Прогон без UI: события печатаются в stdout ПО МЕРЕ ПОСТУПЛЕНИЯ
+    (диалог идёт в фоновом потоке, главный — печатает). Ходы видны сразу в
+    tmux-панели штурма, Ctrl+C корректно прерывает сессию (status=interrupted).
+    Возвращает код выхода."""
     if not network_ok():
         print("⚠ сеть недоступна — модели с интернетом могут зависнуть", file=sys.stderr)
     print(f"arena_chat {__version__} · тема «{topic}»"
-          + (f" · resume {session_id}" if session_id else ""))
+          + (f" · resume {session_id}" if session_id else ""), flush=True)
     stop = threading.Event()
     ev = queue.Queue()
     try:
@@ -968,39 +1028,84 @@ def run_headless(topic, turns, task=None, consensus=False, session_id=None,
     except ValueError as e:
         print(f"⚠ {e}")
         return 2
-    d.run()
-    # P0.2: дождаться опустошения очереди вебхуков (файловый спилл)
-    _webhook_drain()
-    n = 0
-    e = 0
+
+    engine_error = []
+
+    def _engine():
+        try:
+            d.run()
+        except Exception as e:      # warn уже отправлен в очередь из run()
+            engine_error.append(e)
+        finally:
+            ev.put(("__done__", None, None, None))
+
+    th = threading.Thread(target=_engine, daemon=True)
+    th.start()
+
+    n = e_cnt = 0
     c_turn = None
-    while not ev.empty():
-        k, t, x, turn = ev.get()
+    last_status = ""
+
+    def _print_event(k, t, x, turn):
+        nonlocal n, e_cnt, c_turn, last_status
         if k == "msg":
             n += 1
             who = "HERMES" if t == "hermes" else "OMP"
             if quiet:
                 one = " ".join(x.split())
-                print(f"{turn:>3} {who:<6} {now_ts()} | {one[:100]}")
+                print(f"{turn:>3} {who:<6} {now_ts()} | {one[:100]}", flush=True)
             else:
-                print(f"\n[{who}] ход {turn} ({now_ts()}):\n{x}")
+                print(f"\n[{who}] ход {turn} ({now_ts()}):\n{x}", flush=True)
         elif k == "exec":
-            e += 1
-            print(f"\n[EXEC] ({now_ts()}):\n{x}")
+            e_cnt += 1
+            print(f"\n[EXEC] ({now_ts()}):\n{x}", flush=True)
         elif k == "consensus":
             c_turn = turn
             who = "HERMES" if t == "hermes" else "OMP"
             print(f"\n[ИТОГ] ({now_ts()}) ход {turn}: {who} зафиксировал(а) "
-                  f"согласованный вывод (маркер «{x}»)")
+                  f"согласованный вывод (маркер «{x}»)", flush=True)
         elif k == "warn":
-            print(f"\n⚠ {x}")
+            print(f"\n⚠ {x}", flush=True)
+        elif k == "status":
+            last_status = x
+            if not quiet:
+                print(f"· {x}", flush=True)
+
+    interrupted = False
+    try:
+        while True:
+            try:
+                k, t, x, turn = ev.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if k == "__done__":
+                break
+            _print_event(k, t, x, turn)
+    except KeyboardInterrupt:
+        interrupted = True
+        print("\n⏹ Ctrl+C — останавливаю (сессия сохраняется)…", flush=True)
+        stop.set()
+        th.join(timeout=15)
+        # допечатать хвост (в т.ч. «остановлен по /stop»)
+        while not ev.empty():
+            k, t, x, turn = ev.get_nowait()
+            if k != "__done__":
+                _print_event(k, t, x, turn)
+    # P0.2: дождаться опустошения очереди вебхуков (файловый спилл)
+    _webhook_drain()
     tail = ""
     if c_turn:
         tail += f", согласовано на ходе {c_turn}"
-    if e:
-        tail += f", {e} задача выполнена"
-    print(f"\n--- итог: {n} ходов{tail} ---")
-    return 0 if n >= 1 else 1
+    if e_cnt:
+        tail += f", {e_cnt} задача выполнена"
+    if d.sess:
+        tail += f" · сессия {d.sess['session_id']} · {d.sess.get('status')}"
+    print(f"\n--- итог: {n} ходов{tail} ---", flush=True)
+    if engine_error:
+        return 3
+    if interrupted:
+        return 130
+    return 0 if (n >= 1 or e_cnt >= 1) else 1
 
 
 def selftest_drop():
@@ -1191,12 +1296,11 @@ def make_ui(topic, turns, on_event, stop_event, smoke=False):
             except IndexError:
                 target = "last"
             if target == "last":
-                import glob as _glob
-                files = sorted(_glob.glob(os.path.join(sessions_dir(), "*.json")))
+                files = list_session_files()
                 if not files:
                     add_line("⚙", "нет сессий для экспорта", "warn", boxed=False)
                     return
-                target = files[-1]
+                target = files[-1]   # самая свежая по времени изменения
             md = export_session_md(target)
             if md:
                 add_line("⚙", f"экспортировано: {md}", "status", boxed=False)
@@ -1222,6 +1326,7 @@ def make_ui(topic, turns, on_event, stop_event, smoke=False):
                 d = Dialogue(active_topic, current_turns, push_event, stop_event,
                              active_task, consensus=(arena_mode == "consensus"),
                              session_id=sid)
+                stop_event.clear()   # иначе после /stop resume тут же завершится
                 active_topic = d.topic
                 header_text.set_text(("topic", f"ARENA  Hermes ↔ OMP    тема: «{active_topic}»    resume {sid}"))
                 add_line("▶", f"Сессия {sid} восстановлена: {d.base_turns} ходов, тема «{active_topic}»", "topic", boxed=False)
@@ -1230,8 +1335,7 @@ def make_ui(topic, turns, on_event, stop_event, smoke=False):
             except ValueError as e:
                 add_line("⚙", f"ошибка: {e}", "warn", boxed=False)
         elif c == "/sessions":
-            import glob as _g
-            files = sorted(_g.glob(os.path.join(sessions_dir(), "*.json")))
+            files = list_session_files()
             if not files:
                 add_line("⚙", "нет сохранённых сессий", "status", boxed=False)
             else:
@@ -1248,7 +1352,7 @@ def make_ui(topic, turns, on_event, stop_event, smoke=False):
                     except Exception:
                         add_line("⚙", f"  {os.path.basename(f)}  (повреждён)", "warn", boxed=False)
         elif c == "/help":
-            add_line("⚙", "/start <тема> · /stop · /turns N · /task <задача> · /consensus · /resume <id> · /sessions · /clear · /status · /quit", "status", boxed=False)
+            add_line("⚙", "/start <тема> · /stop · /turns N · /task <задача> · /consensus · /resume <id> · /sessions · /export <id|last> · /clear · /status · /quit", "status", boxed=False)
         elif c == "/quit":
             stop_event.set()
             raise urwid.ExitMainLoop()
@@ -1282,14 +1386,14 @@ def make_ui(topic, turns, on_event, stop_event, smoke=False):
         except queue.Empty:
             pass
         # P1.6: спиннер при ожидании модели
+        base = status_text.get_text()[0]
+        has_spin = base[:1] in _SPINNER
         if engine_thread is not None and engine_thread.is_alive():
             _spin_idx[0] = (_spin_idx[0] + 1) % len(_SPINNER)
-            base = status_text.get_text()[0]
-            if not base.startswith(_SPINNER[0]) and not base.startswith(_SPINNER[1]) \
-               and not base.startswith(_SPINNER[2]) and not base.startswith(_SPINNER[3]):
-                status_text.set_text(("thinking", f"{_SPINNER[_spin_idx[0]]} {base}"))
-            else:
-                status_text.set_text(("thinking", f"{_SPINNER[_spin_idx[0]]} {base[2:]}"))
+            plain = base[2:] if has_spin else base
+            status_text.set_text(("thinking", f"{_SPINNER[_spin_idx[0]]} {plain}"))
+        elif has_spin:
+            status_text.set_text(("status", base[2:]))   # диалог завершён — снять спиннер
         if smoke and engine_thread is not None and not engine_thread.is_alive() and ev_queue.empty():
             raise urwid.ExitMainLoop()
         loop.set_alarm_in(0.15, poll_events)
@@ -1337,13 +1441,15 @@ def main():
     ap.add_argument("--webhook", metavar="URL", default=None,
                     help="вебхук событий (перекрывает ARENA_WEBHOOK_URL)")
     ap.add_argument("--export", metavar="SESSION_ID", default=None,
-                    help="экспортировать сессию в Markdown (.md) и выйти")
+                    help="экспортировать сессию в Markdown (.md) и выйти (last = самая свежая)")
     ap.add_argument("--session-info", metavar="SESSION_ID", default=None,
                     help="машиночитаемые метаданные сессии (JSON) и выход")
     ap.add_argument("--selftest-drop", action="store_true",
                     help="автотест обрыва сессии: 2 хода → обрыв → resume → проверка")
     ap.add_argument("--smoke", action="store_true", help="смоук-тест UI (сам стартует и выходит)")
     args = ap.parse_args()
+    if args.turns < 1 or args.turns > 50:
+        ap.error(f"--turns должен быть в диапазоне 1..50 (получено {args.turns})")
 
     prune_old_sessions()
 
@@ -1354,7 +1460,14 @@ def main():
         WEBHOOK_URL = args.webhook
 
     if args.export:
-        md = export_session_md(args.export)
+        target = args.export
+        if target == "last":
+            files = list_session_files()
+            if not files:
+                print("нет сессий для экспорта", file=sys.stderr)
+                sys.exit(1)
+            target = files[-1]
+        md = export_session_md(target)
         if md:
             print(f"экспортировано: {md}")
             sys.exit(0)
